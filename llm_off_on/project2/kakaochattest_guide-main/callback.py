@@ -1,5 +1,5 @@
 from dto import ChatbotRequest
-import aiohttp
+import requests
 import time
 import logging
 import openai
@@ -38,7 +38,7 @@ def create_chain(llm, template_path, output_key):
     )
 
 
-async def callback_handler(request: ChatbotRequest) -> dict:
+def callback_handler(request: ChatbotRequest) -> dict:
     kakao_talk_info_chain = create_chain(llm, "./project_data_카카오싱크.txt", "kakao_talk_info")
 
     question = request.userRequest.utterance
@@ -69,9 +69,17 @@ async def callback_handler(request: ChatbotRequest) -> dict:
     context["question"] = question
     context = answer_chain(context)
     output_text = context["answer"]
-    print(output_text)
+
+    while len(output_text) > 1000:
+        output_text = output_text[:1000]
+        send_kakao_talk_response(output_text, request.userRequest.callbackUrl)
+        output_text = output_text[1000:]
+    send_kakao_talk_response(output_text, request.userRequest.callbackUrl)
+
     # focus
 
+
+def send_kakao_talk_response(output_text: str, url: str):
     payload = {
         "version": "2.0",
         "template": {
@@ -87,9 +95,6 @@ async def callback_handler(request: ChatbotRequest) -> dict:
 
     time.sleep(1.0)
 
-    url = request.userRequest.callbackUrl
-
     if url:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url=url, json=payload, ssl=False) as resp:
-                await resp.json()
+        resp = requests.post(url=url, json=payload)
+        print(resp.status_code)
