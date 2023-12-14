@@ -1,82 +1,111 @@
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores.chroma import Chroma
+from langchain.agents import initialize_agent, AgentType
+from langchain_core.output_parsers import BaseOutputParser
+from langchain_core.tools import Tool
+
 from dto import ChatbotRequest
 import requests
 import time
 import logging
 import openai
 import os
-from langchain.chains import LLMChain, SequentialChain
+from langchain.chains import LLMChain
 from langchain import LLMChain
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts.chat import (
     ChatPromptTemplate,
-    HumanMessagePromptTemplate,
 )
-from langchain.schema import SystemMessage
+from langchain.document_loaders import TextLoader
+import re
 
-# 환경 변수 처리 필요!
 openai.api_key = os.environ.get("OPENAI_API_KEY")
-SYSTEM_MSG = """You are a chatbot that informs you of the features supported by KakaoTalk. Your user will be Korean, so you need to communicate in Korean. 
-            First of all, you need to ask the user what he or she has any questions about KakaoTalk."""
+KAKAO_SYNC_DATA_PATH = "./project_data_카카오싱크.txt"
+QUESTION_PARSER_PROMPT_PATH = "./question_parser_prompt.txt"
 logger = logging.getLogger("Callback")
 llm = ChatOpenAI(temperature=0.1, max_tokens=300, model="gpt-3.5-turbo-16k")
 
 
-def read_prompt_template(file_path: str) -> str:
-    with open(file_path, "r") as f:
-        prompt_template = f.read()
-    return prompt_template
-
-
-def create_chain(llm, template_path, output_key):
+def create_chain(llm, template_path, output_parser):
     return LLMChain(
         llm=llm,
         prompt=ChatPromptTemplate.from_template(
             template=read_prompt_template(template_path),
         ),
-        output_key=output_key,
         verbose=True,
+        output_parser=output_parser
     )
 
 
 def callback_handler(request: ChatbotRequest) -> dict:
-    kakao_talk_info_chain = create_chain(llm, "./project_data_카카오싱크.txt", "kakao_talk_info")
-
-    question = request.userRequest.utterance
-    system_message_prompt = SystemMessage(content=SYSTEM_MSG)
-    human_message = """reference: {kakao_talk_info} question: {question} \n Please answer the questions about the Kakao Talk above."""
-    human_message_prompt = HumanMessagePromptTemplate.from_template(human_message)
-    chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
-
-    answer_chain = LLMChain(
+    question_chain = create_chain(
         llm=llm,
-        prompt=chat_prompt,
-        output_key="answer",
-        verbose=True,
+        template_path=QUESTION_PARSER_PROMPT_PATH,
+        output_parser=QuestionParser()
     )
 
-    preprocess_chain = SequentialChain(
-        chains=[
-            kakao_talk_info_chain,
-            answer_chain,
-        ],
-        input_variables=["question"],
-        output_variables=["kakao_talk_info"],
-        verbose=True,
-    )
+    result = question_chain.run(request.userRequest.utterance)
 
-    context = dict(question=question)
-    context = preprocess_chain(context)
-    context["question"] = question
-    context = answer_chain(context)
-    output_text = context["answer"]
+    functions = [
+        {
+            "name": "search_db",
+            "func": lambda x: search_db(result),
+            "description": "Function to search extra information related to query from the database of Kakao sync"
+        }
+    ]
 
-    while len(output_text) > 1000:
-        output_text = output_text[:1000]
-        send_kakao_talk_response(output_text, request.userRequest.callbackUrl)
-        output_text = output_text[1000:]
+    tools = [
+        Tool(
+            **func
+        ) for func in functions
+    ]
+
+    agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
+
+    output_text = agent.run(result)
+
     send_kakao_talk_response(output_text, request.userRequest.callbackUrl)
 
-    # focus
+
+def search_db(query: str):
+    def query_db(query: str, use_retriever: bool = False) -> list[str]:
+        if use_retriever:
+            docs = retriever.get_relevant_documents(query)
+        else:
+            docs = db.similarity_search(query)
+
+        str_docs = [doc.page_content for doc in docs]
+        return str_docs
+
+    loader = TextLoader(KAKAO_SYNC_DATA_PATH)
+    documents = loader.load()
+
+    text_splitter = CharacterTextSplitter(chunk_size=512, chunk_overlap=128)
+    texts = text_splitter.split_documents(documents)
+
+    db = Chroma.from_documents(
+        texts,
+        OpenAIEmbeddings(),
+        collection_name="kakao_sync",
+    )
+
+    retriever = db.as_retriever()
+
+    query_result = query_db(
+        query=query,
+        use_retriever=True,
+    )
+
+    search_results = []
+    for document in query_result:
+        search_results.append(
+            {
+                "content": document.split(':')[1]
+            }
+        )
+
+    return search_results
 
 
 def send_kakao_talk_response(output_text: str, url: str):
@@ -98,3 +127,18 @@ def send_kakao_talk_response(output_text: str, url: str):
     if url:
         resp = requests.post(url=url, json=payload)
         print(resp.status_code)
+
+
+def read_prompt_template(file_path: str) -> str:
+    with open(file_path, "r") as f:
+        prompt_template = f.read()
+    return prompt_template
+
+
+class QuestionParser(BaseOutputParser):
+    def parse(self, output: str) -> str:
+        result = re.match(r"Detected: (.*)", output)
+        return result.group()
+
+    def get_format_instructions(self) -> str:
+        return "Your response should be in following format.\nDetected: <detected abbreviates several words>"
